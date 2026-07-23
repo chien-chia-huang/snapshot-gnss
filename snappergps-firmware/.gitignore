@@ -22,3 +22,12 @@ firmware_versions/snapper-pressure-sensor/build/*.lst
 firmware_versions/snapper-pressure-sensor/build/*.map
 firmware_versions/snapper-pressure-sensor/build/objects/*.d
 firmware_versions/snapper-pressure-sensor/build/objects/*.o
+
+firmware_versions/snapper-uart/build/*.axf
+firmware_versions/snapper-uart/build/*.bin
+firmware_versions/snapper-uart/build/*.hex
+firmware_versions/snapper-uart/build/*.lst
+firmware_versions/snapper-uart/build/*.map
+firmware_versions/snapper-uart/build/objects/*.d
+firmware_versions/snapper-uart/build/objects/*.o
+firmware_versions/snapper-uart/build/generated/
