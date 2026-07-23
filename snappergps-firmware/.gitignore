@@ -31,3 +31,6 @@ firmware_versions/snapper-uart/build/*.map
 firmware_versions/snapper-uart/build/objects/*.d
 firmware_versions/snapper-uart/build/objects/*.o
 firmware_versions/snapper-uart/build/generated/
+
+firmware_versions/snapper-uart/tools/.venv/
+firmware_versions/snapper-uart/tools/__pycache__/
