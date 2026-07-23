@@ -65,7 +65,8 @@ def worker(data, experiment, mode):
         "H": np.array([51.735383, -1.211070, 100.0]),
         "I": np.array([51.755258204127756, -1.2591261135480434, 100.0]),
         "J": np.array([51.755258204127756, -1.2591261135480434, 100.0]),
-        "K": np.array([51.755258204127756, -1.2591261135480434, 100.0])
+        "K": np.array([51.755258204127756, -1.2591261135480434, 100.0]),
+        "Z": np.array([52.27614766579258, 10.541453358315112, 100.0])
         }
     pos_ref_geo = init_positions[data]
 
@@ -81,7 +82,10 @@ def worker(data, experiment, mode):
         "H": -768.0 - 300.0,
         "I": -768.0,
         "J": -768.0,
-        "K": -768.0
+        "K": -768.0,
+        # No individual calibration available yet for this receiver;
+        # assume the nominal intermediate frequency until calibrated.
+        "Z": 0.0
         }
     # Intermediate frequency [Hz]
     intermediate_frequency = 4092000.0
@@ -100,7 +104,8 @@ def worker(data, experiment, mode):
         "H": 2.0,
         "I": 2.0,
         "J": 2.0,
-        "K": 2.0
+        "K": 2.0,
+        "Z": 2.0
         }
 
     # RINEX navigation data files for different navigation satellite systems
@@ -740,8 +745,9 @@ Valid arguments for <mode> if experiment=4:
     if experiment == 4:
         results = [worker_watson(mode)]
     else:
-        # List of folders
-        data = list(map(chr, range(ord('A'), ord('K')+1)))
+        # List of folders (only datasets whose data is actually present)
+        data = [d for d in list(map(chr, range(ord('A'), ord('K')+1))) + ["Z"]
+                if os.path.isdir(os.path.join("data", d))]
 
         with futures.ProcessPoolExecutor() as pool:
             results = pool.map(worker, data,
