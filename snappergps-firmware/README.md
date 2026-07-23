@@ -12,18 +12,21 @@ The firmware is exclusively written in the C programming language.
 
   * [Repository Structure](#repository-structure)
   * [Building](#building)
+    * [Building with Docker](#building-with-docker)
   * [Flashing](#flashing)
   * [Library](#library)
   * [USB Descriptor](#usb-descriptor)
   * [WebUSB Messages](#webusb-messages)
+  * [Software UART Firmware](#software-uart-firmware)
+    * [Reading the output](#reading-the-output)
   * [Acknowledgements](#acknowledgements)
 
 ## Repository Structure
 
 The firmware is split into two parts:
 
-* A *shared_library* that aims to contain functions that are useful across different firmware version. This includes parts of the [CMSIS](https://developer.arm.com/tools-and-software/embedded/cmsis), the [EMLIB](https://docs.silabs.com/gecko-platform/latest/emlib/api), and the EMUSB libraries as well as custom functions for the timer, the analogue-to-digital converter (ADC), the flash, and the radio of a SnapperGPS receiver.
-* A directory *firmware_versions*, which may contain different variants of the firmware that all build on the *shared-library*. As of writing, this repository just contains the general-purpose standard firmware, the firmware for a SnapperGPS receiver with accelerometer daughter-board, and the firmware for a SnapperGPS with pressure-sensor daughter-board. If you want to create your own firmware versions, then you can add additional sub-directories to *firmware_versions* with the same structure as the existing one.
+* A *shared_library* that aims to contain functions that are useful across different firmware version. This includes parts of the [CMSIS](https://developer.arm.com/tools-and-software/embedded/cmsis), the [EMLIB](https://docs.silabs.com/gecko-platform/latest/emlib/api), and the EMUSB libraries as well as custom functions for the timer, the analogue-to-digital converter (ADC), the flash, the radio, and a bit-banged software UART of a SnapperGPS receiver.
+* A directory *firmware_versions*, which may contain different variants of the firmware that all build on the *shared-library*. As of writing, this repository contains the general-purpose standard firmware ([snapper](firmware_versions/snapper)), the firmware for a SnapperGPS receiver with accelerometer daughter-board ([snapper-accelerometer](firmware_versions/snapper-accelerometer)), the firmware for a SnapperGPS with pressure-sensor daughter-board ([snapper-pressure-sensor](firmware_versions/snapper-pressure-sensor)), and a USB-free variant that streams snapshots out over a software UART instead ([snapper-uart](firmware_versions/snapper-uart), see [Software UART Firmware](#software-uart-firmware)). If you want to create your own firmware versions, then you can add additional sub-directories to *firmware_versions* with the same structure as the existing one.
 
 ## Building
 
@@ -49,6 +52,31 @@ A few notes:
 * If you changed the directory of the shared library, open the make file and modify `SHARED`.
 * If you are using a different microcontroller, then open the make file and modify `TARGET`. The default is `EFM32HG310F64`.
 * If you want to change where the firmware is placed in the flash memory of the microcontroller or if you are using a microcontroller with a different flash memory size, then open the linker file and modify the `ORIGIN` and the `LENGTH` of the `FLASH`. The default reserves 16 KB at the beginning for the bootloader, leaving 48 KB for the SnapperGPS firmware.
+
+### Building with Docker
+
+Instead of installing the Arm GNU Toolchain yourself, you can use the [Dockerfile](Dockerfile) in the root of this repository, which builds an image with the exact toolchain version (`gcc-arm-none-eabi-10-2020-q4-major`) that the make files expect already installed.
+
+This requires [Docker](https://docs.docker.com/get-docker/) to be installed and running.
+
+* Open a terminal in the root of this repository.
+* Build the image once:
+  ```
+  docker build -t snappergps-toolchain .
+  ```
+* Build the standard firmware:
+  ```
+  docker run --rm -v "$PWD":/repo -w /repo/firmware_versions/snapper/build snappergps-toolchain \
+    sh -c 'make TOOLCHAIN_PATH="$TOOLCHAIN_PATH"'
+  ```
+* To build the accelerometer or pressure-sensor variant instead, point `-w` at their `build` directory and use `TOOLPATH` instead of `TOOLCHAIN_PATH`, since those make files reference the toolchain differently:
+  ```
+  docker run --rm -v "$PWD":/repo -w /repo/firmware_versions/snapper-accelerometer/build snappergps-toolchain \
+    sh -c 'make TOOLPATH="$TOOLPATH"'
+  ```
+* Once the process is completed, the resulting `.bin` file will be available in the corresponding `build` directory on your host machine, ready to be flashed, see [next section](#flashing).
+
+Note that the pinned toolchain release predates native Arm64/Apple Silicon Linux builds, so the image is built for `linux/amd64` and runs under emulation on Apple Silicon Macs; this is expected and does not affect the resulting binary.
 
 ## Flashing
 
@@ -429,6 +457,34 @@ void Timer_delayMicroseconds(uint32_t microseconds)
 
 > Pause execution some `microseconds`.
 
+### softwareUart
+
+*A transmit-only, bit-banged UART on GPIO1, used by the [snapper-uart](firmware_versions/snapper-uart) firmware to stream data off the device without USB. It has no RX side. Timing is generated by busy-waiting on TIMER0's free-running counter, so it does not depend on interrupts and keeps working correctly whether the core clock is HFRCO or HFXO at the time.*
+
+```C
+void SoftwareUart_init()
+```
+
+> Configure the TX pin (GPIO1) as a push-pull output that idles high. Call once at start-up.
+
+```C
+void SoftwareUart_enable()
+```
+
+> Enable the TIMER0 clock that provides bit timing. Call before `SoftwareUart_transmit`.
+
+```C
+void SoftwareUart_disable()
+```
+
+> Disable the TIMER0 clock again afterwards to save power.
+
+```C
+void SoftwareUart_transmit(const uint8_t *data, uint32_t length)
+```
+
+> Transmit `length` bytes from `data` at 115200 baud, 8 data bits, no parity, 1 stop bit (8N1), least-significant bit first.
+
 ## USB Descriptor
 
 Find the USB descriptor in [firmware_versions/snapper/inc/usbdescriptors.h](firmware_versions/snapper/inc/usbdescriptors.h).
@@ -753,6 +809,85 @@ typedef struct {
   uint8_t snapshot[6144]
 } usbMessageGetSnapshotOut_t;
 ```
+
+## Software UART Firmware
+
+[firmware_versions/snapper-uart](firmware_versions/snapper-uart) is a variant of the standard firmware for boards that will never be plugged into a USB host. It removes the USB/WebUSB stack and external-flash snapshot storage entirely, and instead streams each snapshot out immediately after capture over a transmit-only, bit-banged software UART on the GPIO1 pin (115200 baud, 8N1, least-significant bit first). It builds and links with the [Docker workflow](#building-with-docker) the same way as the other variants, just with `TOOLPATH` instead of `TOOLCHAIN_PATH`, see that section.
+
+Because there is no USB host to configure it, this firmware behaves differently from the standard firmware in a few important ways:
+
+* It starts recording automatically as soon as it is powered on, rather than waiting to be told to by a `SET_RECORD_MESSAGE`.
+* The measurement interval and the start/end time of the recording window are compile-time constants (`MEASUREMENT_INTERVAL_SECONDS`, `RECORDING_START_TIME`, `RECORDING_END_TIME` at the top of [main.c](firmware_versions/snapper-uart/src/main.c)) instead of runtime-configurable ones. Edit and rebuild if you need different values. The default end time effectively means "never", i.e. it records until it is reset or loses power.
+* There is no host to set the device clock, either. Instead, `main.c` `#include`s a `buildtime.h` that [build/Makefile](firmware_versions/snapper-uart/build/Makefile) regenerates with the current Unix time on every build (see `$(GENDIR)buildtime.h` there), and the firmware seeds its clock from it once at boot. So just build immediately before flashing. The clock then free-runs from that point on; the SnapperGPS post-processing method tolerates the resulting error of a few tens of seconds.
+* Snapshots are never written to the external flash, so nothing is retained if no receiver is listening on the UART line at capture time.
+* There is no over-the-air way to update this firmware, since that mechanism was part of the WebUSB protocol. Re-flashing requires the [SWD interface](#flash-custom-firmware-to-a-device-that-exposes-silicon-labs-serial-wire-debug-swd-interface) (or the USB bootloader, if the board still has one flashed).
+* Transmitting a full snapshot at 115200 baud takes around 535 ms, during which the MCU busy-waits (it cannot sleep), which should be accounted for in the power budget for short measurement intervals.
+* Because there is no debugger attached in normal use, the info frame's `resetCause` field carries the `RMU_RSTCAUSE` bits from whatever reset preceded the current boot (power-on, brown-out, external pin, watchdog, ...), which is otherwise the only way to notice the device is resetting unexpectedly instead of running continuously — repeated info frames arriving is itself a sign of that, since it is normally only sent once.
+
+### Wire format
+
+Two binary frame types are sent, both starting with the same 4-byte sync word, which a receiver can use to re-synchronise if a byte is ever dropped or corrupted. All multi-byte fields, including the trailing CRC, are little-endian (the Cortex-M0+'s native byte order):
+
+```C
+#define UART_SYNC_WORD  {0xAA, 0x55, 0xAA, 0x55}
+```
+
+**Info frame** — sent once, right after boot, before the first snapshot:
+
+```C
+typedef struct {
+  uint8_t syncWord[4];
+  uint8_t frameType;                            // 0x01
+  uint64_t deviceID;
+  uint8_t firmwareVersion[3];
+  uint8_t firmwareDescription[32];
+  uint32_t measurementInterval;                 // Time between 2 snapshots in seconds
+  uint32_t startTime;                           // Unix timestamp of first snapshot
+  uint32_t endTime;                             // Unix timestamp of last snapshot
+  uint32_t resetCause;                          // RMU_RSTCAUSE bits from the reset that preceded this boot
+  uint16_t crc;                                 // CRC-16/CCITT (poly 0x1021) over frameType..resetCause
+} uartInfoFrame_t;
+```
+
+**Snapshot frame** — sent once per captured snapshot:
+
+```C
+typedef struct {
+  uint8_t syncWord[4];
+  uint8_t frameType;                            // 0x02
+  uint32_t time;                                // Unix timestamp (snapshot capture)
+  uint16_t ticks;                               // Clock ticks (snapshot capture) [0-1023]
+  int16_t temperature;                          // Tenths of a degree Celsius
+  uint16_t batteryVoltage;                      // Hundredths of a volt
+  uint16_t snapshotLength;                      // Number of raw snapshot bytes that follow (6144)
+  // uint8_t snapshot[snapshotLength] follows here, i.e. immediately after this header
+  // uint16_t crc follows the snapshot bytes: CRC-16/CCITT (poly 0x1021) over frameType..the last snapshot byte
+} uartSnapshotHeader_t;
+```
+
+The CRC is calculated the same way as `GET_FIRMWARE_CRC_MESSAGE` in the [WebUSB Messages](#webusb-messages) section: an initial value of `0`, one left-shift-and-conditionally-XOR-`0x1021` step per bit (most significant bit first) of every covered byte, followed by 16 additional steps with an input bit of `0` to flush the register.
+
+### Reading the output
+
+[firmware_versions/snapper-uart/tools/read_snapshots.py](firmware_versions/snapper-uart/tools/read_snapshots.py) is a reference host-side script that decodes both frame types above and checks their CRC. Connect a USB-to-UART adapter's RX pin to the device's GPIO1 and its GND to the device's GND (the device only transmits, there is no RX side), then run it from a virtual environment:
+
+```
+cd firmware_versions/snapper-uart/tools
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python read_snapshots.py /dev/cu.usbserial-XXXX
+```
+
+Use the appropriate serial port name for your OS, e.g. `COMx` on Windows. On macOS specifically, use the `/dev/cu.*` device for the adapter, not `/dev/tty.*`: this is a one-way link with no RTS/CTS/DCD lines connected, and the `tty.*` node's blocking behaviour is tied to modem control signals that will never appear here, which can otherwise surface as a confusing `device reports readiness to read but returned no data` error.
+
+Start the script *before* powering on or resetting the device, since the info frame is only ever sent once, right at boot, with no way to request it again.
+
+By default the script assembles a [snapshot-gnss-algorithms](https://github.com/JonasBchrt/snapshot-gnss-algorithms)-compatible dataset (a sibling checkout at `../../../../snapshot-gnss-algorithms/data/Z`, adjust `--out-dir` if your checkout lives elsewhere):
+
+* Each snapshot is saved as `YYYYMMDD_hhmmss.bin`, the exact filename convention `main.py` there parses the capture time out of.
+* Any old `.bin`/`meta.json`/`.rnx` files in the output directory are deleted at startup, so every run starts a clean dataset.
+* On Ctrl+C, it fetches the current day's merged multi-GNSS broadcast ephemeris (via [fetch_ephemeris.py](firmware_versions/snapper-uart/tools/fetch_ephemeris.py), from BKG's anonymous mirror rather than CDDIS, which requires a NASA Earthdata login; BKG's live file needs its satellite records reordered into the G-E-C sequence `rinex_preprocessor.preprocess_rinex` requires, which this script does automatically) and writes a `meta.json` (ground-truth latitude/longitude, intermediate frequency, and a `file`/`timestamp` list) matching the format of the algorithms repo's other datasets — note that repo's own code does not actually read `meta.json`, it is only for your own bookkeeping.
+* Pass `--latitude`/`--longitude` for the ground-truth position of your capture site, and see `--help` for the rest.
 
 ## Acknowledgements
 
