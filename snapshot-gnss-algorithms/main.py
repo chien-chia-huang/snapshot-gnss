@@ -678,9 +678,14 @@ def worker_watson(mode):
 if __name__ == '__main__':
 
     usage = f"""
-Usage: python {sys.argv[0]} [-h] | [-e <experiment>] [-m <mode>]
+Usage: python {sys.argv[0]} [-h] | [-e <experiment>] [-m <mode>] [-d <dataset>]
 
 Example: python {sys.argv[0]} -e 1 -m "ls-sac"
+Example: python {sys.argv[0]} -e 1 -m "ls-sac" -d Z
+
+Valid arguments for <dataset>: a single dataset letter (e.g. "Z") to run
+    just that one instead of every dataset found under data/. Only valid
+    for experiment 1, 2, or 3 (experiment 4 always uses its own dataset).
 
 Valid arguments for <experiment>: 1, 2, 3, 4
 Valid arguments for <mode> if experiment=1:
@@ -696,10 +701,11 @@ Valid arguments for <mode> if experiment=4:
     argv = sys.argv[1:]
     options, arguments = getopt.getopt(
         argv,
-        "he:m:",
-        ["help", "experiment=", "mode="])
+        "he:m:d:",
+        ["help", "experiment=", "mode=", "dataset="])
     experiment = None
     mode = None
+    dataset = None
     for opt, arg in options:
         if opt in ("-h", "--help"):
             print(usage)
@@ -708,6 +714,8 @@ Valid arguments for <mode> if experiment=4:
             experiment = arg
         elif opt in ("-m", "--mode"):
             mode = arg
+        elif opt in ("-d", "--dataset"):
+            dataset = arg
     try:
         experiment = int(experiment)
     except TypeError:
@@ -745,9 +753,17 @@ Valid arguments for <mode> if experiment=4:
     if experiment == 4:
         results = [worker_watson(mode)]
     else:
-        # List of folders (only datasets whose data is actually present)
-        data = [d for d in list(map(chr, range(ord('A'), ord('K')+1))) + ["Z"]
-                if os.path.isdir(os.path.join("data", d))]
+        if dataset is not None:
+            # Run just the one requested dataset
+            if not os.path.isdir(os.path.join("data", dataset)):
+                raise SystemExit(
+                    f"Dataset '{dataset}' not found under data/."
+                    )
+            data = [dataset]
+        else:
+            # List of folders (only datasets whose data is actually present)
+            data = [d for d in list(map(chr, range(ord('A'), ord('K')+1))) + ["Z"]
+                    if os.path.isdir(os.path.join("data", d))]
 
         with futures.ProcessPoolExecutor() as pool:
             results = pool.map(worker, data,
