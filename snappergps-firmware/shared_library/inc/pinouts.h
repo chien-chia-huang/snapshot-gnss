@@ -67,6 +67,16 @@
 #define GPIO3_PORT              gpioPortA
 #define GPIO3_PIN               2
 
+/* LEUART0 (used by snapper-uart for the bidirectional nRF9151 command
+ * link - USB_DM/USB_DP, otherwise unused since this firmware doesn't run
+ * a USB stack). LOC5 routes LEUART0_TX to PC14 and LEUART0_RX to PC15. */
+
+#define USB_DM_PORT              gpioPortC
+#define USB_DM_PIN               14
+
+#define USB_DP_PORT              gpioPortC
+#define USB_DP_PIN               15
+
 /* Battery */
 
 #define VBAT_SENSE_EN_PORT      gpioPortD

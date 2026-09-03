@@ -5,15 +5,30 @@
 #include "em_emu.h"
 #include "em_rmu.h"
 #include "em_rtc.h"
+#include "em_gpio.h"
 #include "em_chip.h"
 #include "em_device.h"
+#include "em_leuart.h"
 #include "em_system.h"
 
 #include "radio.h"
 #include "timer.h"
 #include "pinouts.h"
-#include "softwareUart.h"
 #include "analogToDigitalConverter.h"
+
+/*
+ * NOT for real deployment - power efficiency is deliberately out of scope
+ * for now. Set to 1 to keep the HF oscillator running (EM1 instead of EM3)
+ * between measurement intervals, so LEUART0 never loses its clock.
+ *
+ * Originally added to test an EM3-wake-race theory for why CMD_START never
+ * got ACKed - that theory turned out to be wrong (root cause was a missing
+ * GPIO_PinModeSet() for LEUART0's TX pin in Leuart_init(), unrelated to
+ * sleep state), but EM1 has been left on since real EM3 sleep hasn't been
+ * re-validated against the fixed firmware yet. Set to 0 once that's done -
+ * EM1 draws meaningfully more power than EM3 for no benefit in real use.
+ */
+#define DEBUG_STAY_IN_EM1_NOT_EM3 1
 
 /* LED pattern hyperparameters */
 
@@ -91,19 +106,6 @@
 
 #define RECORDING_END_TIME                      0x7FFFFFFF
 
-/*
- * There is no USB host to set the clock any more either, so the device
- * clock is seeded once at boot from a compile-time Unix timestamp
- * instead. The Makefile regenerates buildtime.h with the current time
- * on every build (see $(GENDIR)buildtime.h in build/Makefile), so this
- * happens automatically; just build immediately before flashing. The
- * clock will free-run from that value afterwards; the SnapperGPS
- * post-processing method tolerates the resulting error of a few tens of
- * seconds without difficulty.
- */
-
-#include "buildtime.h"
-
 /* Software UART protocol constants */
 
 #define UART_SYNC_WORD_LENGTH                   4
@@ -112,7 +114,13 @@
 
 typedef enum {
     UART_FRAME_INFO = 0x01,
-    UART_FRAME_SNAPSHOT = 0x02
+    UART_FRAME_SNAPSHOT = 0x02,
+    UART_FRAME_CMD_START = 0x10,                  // nRF9151 -> SnapperGPS: start auto-capturing
+    UART_FRAME_CMD_STOP = 0x11,                    // nRF9151 -> SnapperGPS: stop auto-capturing
+    UART_FRAME_CMD_SET_TIME = 0x12,                // nRF9151 -> SnapperGPS: set RTC clock.
+                                                    // 4-byte little-endian Unix timestamp
+                                                    // payload (seconds only)
+    UART_FRAME_ACK = 0x20                          // SnapperGPS -> nRF9151: 1-byte payload = resulting capturingEnabled
 } uartFrameType_t;
 
 /* Device state enumerations */
@@ -172,6 +180,14 @@ static uint32_t startTime = RECORDING_START_TIME;
 
 static uint32_t endTime = RECORDING_END_TIME;
 
+/* Gates whether the RTC-driven measurement-interval handler actually
+ * captures and sends a snapshot, or just no-ops and reschedules. Does not
+ * touch the RTC cadence itself - only what the nRF9151 command channel
+ * (LEUART0_IRQHandler, below) is allowed to turn on/off. Starts false: the
+ * device boots idle and waits for an explicit CMD_START. */
+
+static volatile bool capturingEnabled = false;
+
 /* Global volatile event flags */
 
 static volatile bool eventRTC_Comp0;
@@ -213,6 +229,22 @@ void RTC_IRQHandler(void) {
     // Clear the RTC interrupt flag
 
     RTC_IntClear(interruptMask);
+
+}
+
+/* GPIO_ODD_IRQHandler's only job is to end EM2/EM3 on an edge from the
+ * nRF9151 starting a command frame on PC15/USB_DP - LEUART0 is clocked
+ * from cmuSelect_HFCLKLE (see Leuart_init()), which is inert while the HF
+ * oscillator is stopped in EM2/EM3, so a plain, clock-independent GPIO
+ * edge is what actually wakes the core. Once awake, main()'s loop resumes
+ * and LEUART0 (already configured) takes over receiving the byte stream
+ * for real - this handler does nothing else. */
+
+void GPIO_ODD_IRQHandler(void) {
+
+    uint32_t interruptMask = GPIO_IntGet();
+
+    GPIO_IntClear(interruptMask);
 
 }
 
@@ -308,7 +340,217 @@ static uint16_t crcFinalize(uint16_t crc) {
 
 }
 
-/* Software UART frame functions */
+/* LEUART0 functions - PC14 (TX, sync+info+snapshot+ACK) / PC15 (RX,
+ * commands from the nRF9151), both at 115200 baud, replacing the old
+ * bit-banged softwareUart.c/GPIO1 link this firmware version used to use. */
+
+static void Leuart_transmit(const uint8_t *data, size_t len) {
+
+    for (size_t i = 0; i < len; ++i) {
+        LEUART_Tx(LEUART0, data[i]);   // blocks until TX buffer has room; hardware paces the bits
+    }
+
+}
+
+static void sendAckFrame(bool enabled) {
+
+    uint8_t frame[UART_SYNC_WORD_LENGTH + 1 /* type */ + 1 /* payload */ + 2 /* crc */];
+
+    memcpy(frame, uartSyncWord, UART_SYNC_WORD_LENGTH);
+    frame[UART_SYNC_WORD_LENGTH] = UART_FRAME_ACK;
+    frame[UART_SYNC_WORD_LENGTH + 1] = enabled ? 1 : 0;
+
+    uint16_t crc = crcFinalize(crcUpdateBytes(0, &frame[UART_SYNC_WORD_LENGTH], 2));
+
+    frame[UART_SYNC_WORD_LENGTH + 2] = (uint8_t)crc;
+    frame[UART_SYNC_WORD_LENGTH + 3] = (uint8_t)(crc >> 8);
+
+    Leuart_transmit(frame, sizeof(frame));
+
+}
+
+/* Incoming command parser state, fed one byte at a time from
+ * LEUART0_IRQHandler. Unlike the old bit-banged design, each byte arrives
+ * via its own hardware interrupt rather than a busy-wait loop, so there's
+ * no risk of this handler hanging - it always processes exactly one byte
+ * and returns. */
+
+typedef enum {
+    CMD_STATE_SYNC,
+    CMD_STATE_TYPE,
+    CMD_STATE_PAYLOAD,
+    CMD_STATE_CRC
+} cmdParserState_t;
+
+static cmdParserState_t cmdState = CMD_STATE_SYNC;
+
+static uint8_t cmdSyncWindow[UART_SYNC_WORD_LENGTH];
+static uint8_t cmdSyncWindowLen;
+
+static uint8_t cmdType;
+
+// Only CMD_SET_TIME carries a payload today (a 4-byte little-endian Unix
+// timestamp) - sized for that, not a general per-type length table.
+static uint8_t cmdPayloadBytes[4];
+static uint8_t cmdPayloadLen;
+static uint8_t cmdPayloadIndex;
+
+static uint8_t cmdCrcBytes[2];
+static uint8_t cmdCrcIndex;
+
+static void handleCommandByte(uint8_t byte) {
+
+    switch (cmdState) {
+
+    case CMD_STATE_SYNC:
+
+        if (cmdSyncWindowLen < UART_SYNC_WORD_LENGTH) {
+            cmdSyncWindow[cmdSyncWindowLen++] = byte;
+        } else {
+            memmove(cmdSyncWindow, cmdSyncWindow + 1, UART_SYNC_WORD_LENGTH - 1);
+            cmdSyncWindow[UART_SYNC_WORD_LENGTH - 1] = byte;
+        }
+
+        if (cmdSyncWindowLen == UART_SYNC_WORD_LENGTH &&
+            memcmp(cmdSyncWindow, uartSyncWord, UART_SYNC_WORD_LENGTH) == 0) {
+            cmdState = CMD_STATE_TYPE;
+        }
+
+        break;
+
+    case CMD_STATE_TYPE:
+
+        cmdType = byte;
+        cmdPayloadIndex = 0;
+        cmdCrcIndex = 0;
+
+        if (cmdType == UART_FRAME_CMD_SET_TIME) {
+            cmdPayloadLen = sizeof(cmdPayloadBytes);
+            cmdState = CMD_STATE_PAYLOAD;
+        } else {
+            cmdPayloadLen = 0;
+            cmdState = CMD_STATE_CRC;
+        }
+
+        break;
+
+    case CMD_STATE_PAYLOAD:
+
+        cmdPayloadBytes[cmdPayloadIndex++] = byte;
+
+        if (cmdPayloadIndex == cmdPayloadLen) {
+            cmdState = CMD_STATE_CRC;
+        }
+
+        break;
+
+    case CMD_STATE_CRC:
+
+        cmdCrcBytes[cmdCrcIndex++] = byte;
+
+        if (cmdCrcIndex == 2) {
+
+            uint16_t crcCalc = crcUpdateBytes(0, &cmdType, 1);
+
+            if (cmdPayloadLen > 0) {
+                crcCalc = crcUpdateBytes(crcCalc, cmdPayloadBytes, cmdPayloadLen);
+            }
+
+            crcCalc = crcFinalize(crcCalc);
+
+            uint16_t crcRecv = (uint16_t)cmdCrcBytes[0] | ((uint16_t)cmdCrcBytes[1] << 8);
+
+            if (crcCalc == crcRecv) {
+
+                if (cmdType == UART_FRAME_CMD_START || cmdType == UART_FRAME_CMD_STOP) {
+
+                    capturingEnabled = (cmdType == UART_FRAME_CMD_START);
+
+                    // Steady-state LED: green while running, red while
+                    // stopped - not a flash, a persistent indicator.
+                    enableGreenLED(capturingEnabled);
+                    enableRedLED(!capturingEnabled);
+
+                    sendAckFrame(capturingEnabled);
+
+                } else if (cmdType == UART_FRAME_CMD_SET_TIME) {
+
+                    uint32_t newTime = (uint32_t)cmdPayloadBytes[0]
+                                      | ((uint32_t)cmdPayloadBytes[1] << 8)
+                                      | ((uint32_t)cmdPayloadBytes[2] << 16)
+                                      | ((uint32_t)cmdPayloadBytes[3] << 24);
+
+                    setTime(newTime, 0);
+                    sendAckFrame(capturingEnabled); // unchanged by CMD_SET_TIME
+
+                }
+
+            }
+            // CRC mismatch or unknown type: silently dropped, no ACK - the
+            // nRF9151 retries on a missing ACK.
+
+            cmdState = CMD_STATE_SYNC;
+            cmdSyncWindowLen = 0;
+
+        }
+
+        break;
+
+    }
+
+}
+
+void LEUART0_IRQHandler(void) {
+
+    uint32_t flags = LEUART_IntGet(LEUART0);
+
+    LEUART_IntClear(LEUART0, flags);
+
+    if (!(flags & LEUART_IF_RXDATAV)) return;
+
+    handleCommandByte(LEUART_RxDataGet(LEUART0));
+
+}
+
+static void Leuart_init(void) {
+
+    // The LEUART0->ROUTE assignment below only tells the peripheral which
+    // pins to use - it does NOT configure the GPIO pad itself. Without this,
+    // PC14 stays in its post-reset disabled/tristate state and LEUART_Tx()
+    // silently does nothing externally visible, even though the peripheral
+    // and its internal shift register work fine. Initial output value 1
+    // matches UART's idle-high convention.
+    //
+    // PC15 (RX) doesn't need an equivalent call here: main() already puts it
+    // in gpioModeInputPullFilter for the GPIO-wake interrupt, and that mode
+    // happens to also be exactly what LEUART0's RX function needs.
+
+    GPIO_PinModeSet(USB_DM_PORT, USB_DM_PIN, gpioModePushPull, 1);
+
+    CMU_ClockEnable(cmuClock_LEUART0, true);
+
+    // HFCLKLE-sourced (a divided tap off the main HF clock) -> supports
+    // 115200 baud, but only while the HF oscillator is running (EM0/EM1).
+    // LEUART0 is inert in EM2/EM3; wake is handled separately by the plain
+    // GPIO edge interrupt on PC15 (GPIO_ODD_IRQHandler, above), not by this
+    // peripheral. cmuClock_LFB is the RTC's cmuClock_LFA's independent
+    // sibling branch, so this doesn't disturb RTC timing.
+
+    CMU_ClockSelectSet(cmuClock_LFB, cmuSelect_HFCLKLE);
+
+    LEUART_Init_TypeDef init = LEUART_INIT_DEFAULT;
+    init.baudrate = 115200;
+
+    LEUART_Init(LEUART0, &init);
+
+    LEUART0->ROUTE = LEUART_ROUTE_TXPEN | LEUART_ROUTE_RXPEN | LEUART_ROUTE_LOCATION_LOC5; // PC14 TX / PC15 RX
+
+    LEUART_IntEnable(LEUART0, LEUART_IEN_RXDATAV);
+
+    NVIC_ClearPendingIRQ(LEUART0_IRQn);
+    NVIC_EnableIRQ(LEUART0_IRQn);
+
+}
 
 static void sendInfoFrame() {
 
@@ -331,11 +573,7 @@ static void sendInfoFrame() {
 
     frame.crc = crcFinalize(crc);
 
-    SoftwareUart_enable();
-
-    SoftwareUart_transmit((uint8_t*)&frame, sizeof(frame));
-
-    SoftwareUart_disable();
+    Leuart_transmit((uint8_t*)&frame, sizeof(frame));
 
 }
 
@@ -364,15 +602,11 @@ static void sendSnapshotFrame(uint32_t time, uint32_t ticks, int32_t temperature
 
     uint8_t crcBytes[2] = {(uint8_t)crc, (uint8_t)(crc >> 8)};
 
-    SoftwareUart_enable();
+    Leuart_transmit((uint8_t*)&header, sizeof(header));
 
-    SoftwareUart_transmit((uint8_t*)&header, sizeof(header));
+    Leuart_transmit((uint8_t*)SNAPSHOT_BUFFER_LOCATION, SNAPSHOT_BUFFER_SIZE);
 
-    SoftwareUart_transmit((uint8_t*)SNAPSHOT_BUFFER_LOCATION, SNAPSHOT_BUFFER_SIZE);
-
-    SoftwareUart_transmit(crcBytes, sizeof(crcBytes));
-
-    SoftwareUart_disable();
+    Leuart_transmit(crcBytes, sizeof(crcBytes));
 
 }
 
@@ -459,13 +693,26 @@ int main(void) {
     AnalogToDigitalConverter_disableBatteryMeasurement();
     AnalogToDigitalConverter_disable();
 
-    // Seed the clock, since there is no USB host to set it at runtime
+    // Clock starts at epoch 0 here; it's seeded for real once the nRF9151 sends
+    // a CMD_SET_TIME command (see handleCommandByte()) - harmless in the
+    // meantime, since capturingEnabled stays false (no snapshots captured)
+    // until CMD_START, and CMD_SET_TIME follows immediately after that.
 
-    setTime(INITIAL_UNIX_TIME, 0);
+    // Set up LEUART0 (PC14 TX / PC15 RX) for the nRF9151 link
 
-    // Set up the software UART TX pin
+    Leuart_init();
 
-    SoftwareUart_init();
+    // Wake from EM2/EM3 on an edge from the nRF9151 starting a command
+    // frame on PC15/USB_DP - mirrors the USB_SENSE GPIO-wake pattern from
+    // firmware_versions/snapper/src/main.c, the only existing precedent in
+    // this codebase for waking on a GPIO edge rather than the RTC.
+
+    GPIO_PinModeSet(USB_DP_PORT, USB_DP_PIN, gpioModeInputPullFilter, 1);
+
+    GPIO_IntConfig(USB_DP_PORT, USB_DP_PIN, true, true, true);
+
+    NVIC_ClearPendingIRQ(GPIO_ODD_IRQn);
+    NVIC_EnableIRQ(GPIO_ODD_IRQn);
 
     // Announce the device and its recording configuration once
 
@@ -479,6 +726,12 @@ int main(void) {
         enableGreenLED(false);
         Timer_delayMilliseconds(100);
     }
+
+    // Steady-state LED baseline at boot: red (stopped), matching
+    // capturingEnabled's false default - see handleCommandByte(), which
+    // swaps this to green on CMD_START and back to red on CMD_STOP.
+
+    enableRedLED(true);
 
     // Get the current time and the current real-time counter compare register value
 
@@ -595,6 +848,8 @@ int main(void) {
 
                 }
 
+                if (capturingEnabled) {
+
                 /* Enable DC boost */
 
                 enableDCBoost();
@@ -675,17 +930,16 @@ int main(void) {
 
                 Radio_powerOff();
 
-                if (frequencyGood) {
+                if (!frequencyGood) {
 
-                    // Flash green LED once
-
-                    enableGreenLED(true);
-                    Timer_delayMilliseconds(10);
-                    enableGreenLED(false);
-
-                } else {
-
-                    // Flash red LED once
+                    // Flash red LED once - a diagnostic blip on top of the
+                    // steady green "running" state (see handleCommandByte()),
+                    // returning to red-off afterwards since that's the
+                    // correct baseline while capturingEnabled is true. No
+                    // equivalent flash on success: the steady green already
+                    // conveys "running and fine," and briefly toggling it
+                    // off here would kill that steady indicator instead of
+                    // just blipping on top of it.
 
                     enableRedLED(true);
                     Timer_delayMilliseconds(10);
@@ -707,6 +961,8 @@ int main(void) {
 
                 if (state == STATE_WILL_RECORD) Timer_disable();
 
+                } // if (capturingEnabled)
+
             } else {
 
                 --delayedStartCount;
@@ -721,24 +977,17 @@ int main(void) {
 
             if (eventRTC_Comp1) {
 
-                // Still waiting to record first snapshot
+                // Still waiting to record first snapshot. No LED flash here
+                // any more - it used to briefly flash both LEDs, but that
+                // unconditionally turned them both off afterwards, which
+                // would fight the steady green/red run-state indicator (see
+                // handleCommandByte()) every LED_INTERVAL_SECONDS until the
+                // first RTC_COMP0 tick disables this handler for good.
 
                 // Update the real-time counter compare register for the next interrupt
 
                 RTC_CompareSet(RTC_COMP1, RTC_CompareGet(RTC_COMP1)
                                           + LED_INTERVAL_SECONDS * LFXO_TICKS_PER_SECOND);
-
-                // Flash LEDs
-
-                Timer_enable();
-
-                enableGreenLED(true);
-                enableRedLED(true);
-                Timer_delayMilliseconds(10);
-                enableGreenLED(false);
-                enableRedLED(false);
-
-                Timer_disable();
 
                 // Reset interrupt flag
 
@@ -750,7 +999,13 @@ int main(void) {
 
         // Enter EM3 if recording more snapshots
 
-        if (state == STATE_WILL_RECORD)  EMU_EnterEM3(false);
+        if (state == STATE_WILL_RECORD) {
+#if DEBUG_STAY_IN_EM1_NOT_EM3
+            EMU_EnterEM1();
+#else
+            EMU_EnterEM3(false);
+#endif
+        }
 
     }
 

@@ -23,7 +23,7 @@ SHARED = ../../../shared_library/
 # USB, so $(SHARED)/emusb is intentionally left out. Its sources reference
 # usbconfig.h, which this firmware version does not provide.
 
-INC = $(SHARED)/cmsis $(SHARED)/device/inc $(SHARED)/emlib/inc $(SHARED)/inc $(GENDIR)
+INC = $(SHARED)/cmsis $(SHARED)/device/inc $(SHARED)/emlib/inc $(SHARED)/inc
 SRC = $(SHARED)/device/src $(SHARED)/emlib/src $(SHARED)/src ../src
 
 # Set the name of the output files
@@ -33,10 +33,6 @@ FILENAME = uart-snapper
 # This is the location of the resulting object files
 
 OBJPATH = ./objects/
-
-# This is the location of build-generated headers (currently just buildtime.h)
-
-GENDIR = ./generated/
 
 # Set the target EFM32HG to that used in Snapper
 
@@ -80,22 +76,6 @@ DFLAGS = -MMD
 .PHONY: all
 all: $(FILENAME).bin
 
-# Regenerate a header with the current Unix time on every invocation of
-# make (the .PHONY prerequisite means this target is always considered
-# out of date), so that main.c always seeds its clock close to the
-# actual flash time without needing to be edited by hand. main.o is
-# given an explicit dependency on it below so that it always gets
-# recompiled when the timestamp changes.
-
-$(GENDIR)buildtime.h: FORCE
-	@mkdir -p $(GENDIR)
-	@echo '#define INITIAL_UNIX_TIME $(shell date +%s)' > $@
-
-.PHONY: FORCE
-FORCE:
-
-$(OBJPATH)main.o: $(GENDIR)buildtime.h
-
 $(OBJPATH)%.o: %.c
 	@mkdir -p $(OBJPATH)
 	@echo 'Building' $@
@@ -122,7 +102,6 @@ $(FILENAME).bin: $(OBJ)
 clean:
 	rm -f $(OBJPATH)*.o
 	rm -f $(OBJPATH)*.d
-	rm -rf $(GENDIR)
 	rm -f $(FILENAME).axf
 	rm -f $(FILENAME).bin
 	rm -f $(FILENAME).hex

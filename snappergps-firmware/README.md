@@ -74,7 +74,17 @@ This requires [Docker](https://docs.docker.com/get-docker/) to be installed and 
   docker run --rm -v "$PWD":/repo -w /repo/firmware_versions/snapper-accelerometer/build snappergps-toolchain \
     sh -c 'make TOOLPATH="$TOOLPATH"'
   ```
+* Build the firmware with UART output:
+  ```
+  docker run --rm -v "$PWD":/repo -w /repo/firmware_versions/snapper-uart/build snappergps-toolchain \
+    sh -c 'make TOOLCHAIN_PATH="$TOOLCHAIN_PATH"'
+  ```
 * Once the process is completed, the resulting `.bin` file will be available in the corresponding `build` directory on your host machine, ready to be flashed, see [next section](#flashing).
+* To remove the build artifacts afterwards, run `make clean` the same way, pointing `-w` at whichever variant's `build` directory you used above:
+  ```
+  docker run --rm -v "$PWD":/repo -w /repo/firmware_versions/snapper-uart/build snappergps-toolchain \
+    sh -c 'make clean'
+  ```
 
 Note that the pinned toolchain release predates native Arm64/Apple Silicon Linux builds, so the image is built for `linux/amd64` and runs under emulation on Apple Silicon Macs; this is expected and does not affect the resulting binary.
 
@@ -812,27 +822,30 @@ typedef struct {
 
 ## Software UART Firmware
 
-[firmware_versions/snapper-uart](firmware_versions/snapper-uart) is a variant of the standard firmware for boards that will never be plugged into a USB host. It removes the USB/WebUSB stack and external-flash snapshot storage entirely, and instead streams each snapshot out immediately after capture over a transmit-only, bit-banged software UART on the GPIO1 pin (115200 baud, 8N1, least-significant bit first). It builds and links with the [Docker workflow](#building-with-docker) the same way as the other variants, just with `TOOLPATH` instead of `TOOLCHAIN_PATH`, see that section.
+[firmware_versions/snapper-uart](firmware_versions/snapper-uart) is a variant of the standard firmware for boards that will never be plugged into a USB host. It removes the USB/WebUSB stack and external-flash snapshot storage entirely, and instead streams each snapshot out immediately after capture over LEUART0 (PC14 TX / PC15 RX, 115200 8N1) - a genuine, bidirectional hardware UART, not the original bit-banged, transmit-only GPIO1 link this firmware version used to use. It builds and links with the [Docker workflow](#building-with-docker) the same way as the other variants, just with `TOOLPATH` instead of `TOOLCHAIN_PATH`, see that section. The latest built [`uart-snapper.bin`](firmware_versions/snapper-uart/build/uart-snapper.bin)/[`uart-snapper.hex`](firmware_versions/snapper-uart/build/uart-snapper.hex) are tracked directly in this repo (an intentional exception to the `build/` gitignore rule below), so you can download and flash them straight away without setting up the Docker toolchain first - just remember these go stale the moment `src/` changes and aren't rebuilt/recommitted.
 
-Because there is no USB host to configure it, this firmware behaves differently from the standard firmware in a few important ways:
+This variant is paired with a separate nRF9151 cellular-uplink firmware (its own repository) over that LEUART0 link, which decides when SnapperGPS actually records and forwards its frames over cellular - see [Wire format](#wire-format) below for the command channel this enables. Because there is no USB host to configure it directly, this firmware behaves differently from the standard firmware in a few other important ways:
 
-* It starts recording automatically as soon as it is powered on, rather than waiting to be told to by a `SET_RECORD_MESSAGE`.
 * The measurement interval and the start/end time of the recording window are compile-time constants (`MEASUREMENT_INTERVAL_SECONDS`, `RECORDING_START_TIME`, `RECORDING_END_TIME` at the top of [main.c](firmware_versions/snapper-uart/src/main.c)) instead of runtime-configurable ones. Edit and rebuild if you need different values. The default end time effectively means "never", i.e. it records until it is reset or loses power.
-* There is no host to set the device clock, either. Instead, `main.c` `#include`s a `buildtime.h` that [build/Makefile](firmware_versions/snapper-uart/build/Makefile) regenerates with the current Unix time on every build (see `$(GENDIR)buildtime.h` there), and the firmware seeds its clock from it once at boot. So just build immediately before flashing. The clock then free-runs from that point on; the SnapperGPS post-processing method tolerates the resulting error of a few tens of seconds.
+* There is no host to set the device clock either - the nRF9151 pushes a live Unix timestamp down over the command channel (`CMD_SET_TIME`, see below) once recording actually starts, rather than this firmware seeding it from a stale build-time constant. Until that first `CMD_SET_TIME` arrives, the clock sits at Unix epoch 0 - harmless, since no snapshots are captured until `CMD_START` anyway, and `CMD_SET_TIME` follows immediately after that on the nRF9151 side.
 * Snapshots are never written to the external flash, so nothing is retained if no receiver is listening on the UART line at capture time.
 * There is no over-the-air way to update this firmware, since that mechanism was part of the WebUSB protocol. Re-flashing requires the [SWD interface](#flash-custom-firmware-to-a-device-that-exposes-silicon-labs-serial-wire-debug-swd-interface) (or the USB bootloader, if the board still has one flashed).
 * Transmitting a full snapshot at 115200 baud takes around 535 ms, during which the MCU busy-waits (it cannot sleep), which should be accounted for in the power budget for short measurement intervals.
 * Because there is no debugger attached in normal use, the info frame's `resetCause` field carries the `RMU_RSTCAUSE` bits from whatever reset preceded the current boot (power-on, brown-out, external pin, watchdog, ...), which is otherwise the only way to notice the device is resetting unexpectedly instead of running continuously — repeated info frames arriving is itself a sign of that, since it is normally only sent once.
+* Onboard LED state is a simple steady-state run indicator, not a flash: solid red at boot and after `CMD_STOP` (idle, not capturing), solid green after a confirmed `CMD_START` (capturing). A brief red blip on top of the steady green marks an individual capture where the HFXO frequency check failed; there is no equivalent flash on success, since the steady green already conveys "running and fine."
+* **Known temporary limitation:** the main loop currently stays in EM1 rather than sleeping in EM3 between measurement intervals (`DEBUG_STAY_IN_EM1_NOT_EM3` in `main.c`), which costs meaningfully more power than the original design. This was left in place while hardware-bringing-up the LEUART0 link (see the TX gotcha below) and hasn't yet been re-validated with real EM3 sleep restored - re-enable it once that's done.
+
+**Hardware bring-up gotcha worth knowing:** `LEUART0->ROUTE` (which pins the peripheral uses) and the GPIO pin's own mode register are independent on the EFM32 - setting `ROUTE` alone does *not* configure the pad. `Leuart_init()` was originally missing a `GPIO_PinModeSet(USB_DM_PORT, USB_DM_PIN, gpioModePushPull, 1)` call for PC14 (TX): the peripheral and its internal shift register worked fine, but nothing ever reached the physical pin, so nothing SnapperGPS ever "sent" - not the info frame, not an ACK, nothing - was ever externally visible, despite the receiving side (confirmed independently) correctly receiving commands the whole time. Confirmed via a logic-level capture directly on the TX pin showing genuinely nothing, versus the correctly-formed command frames independently confirmed present on the RX pin.
 
 ### Wire format
 
-Two binary frame types are sent, both starting with the same 4-byte sync word, which a receiver can use to re-synchronise if a byte is ever dropped or corrupted. All multi-byte fields, including the trailing CRC, are little-endian (the Cortex-M0+'s native byte order):
+Frame types are sent in both directions and all start with the same 4-byte sync word, which a receiver can use to re-synchronise if a byte is ever dropped or corrupted. All multi-byte fields, including the trailing CRC, are little-endian (the Cortex-M0+'s native byte order):
 
 ```C
 #define UART_SYNC_WORD  {0xAA, 0x55, 0xAA, 0x55}
 ```
 
-**Info frame** — sent once, right after boot, before the first snapshot:
+**Info frame** (SnapperGPS -> nRF9151) — sent once, right after boot, before the first snapshot:
 
 ```C
 typedef struct {
@@ -849,7 +862,7 @@ typedef struct {
 } uartInfoFrame_t;
 ```
 
-**Snapshot frame** — sent once per captured snapshot:
+**Snapshot frame** (SnapperGPS -> nRF9151) — sent once per captured snapshot, only while capturing is enabled (see `CMD_START` below):
 
 ```C
 typedef struct {
@@ -865,11 +878,33 @@ typedef struct {
 } uartSnapshotHeader_t;
 ```
 
+**Command frames** (nRF9151 -> SnapperGPS) — sync word + type + CRC, no payload except `CMD_SET_TIME`:
+
+```C
+#define UART_FRAME_CMD_START    0x10  // start auto-capturing
+#define UART_FRAME_CMD_STOP     0x11  // stop auto-capturing
+#define UART_FRAME_CMD_SET_TIME 0x12  // followed by a 4-byte little-endian Unix timestamp (seconds)
+```
+The CRC for `CMD_SET_TIME` covers `frameType` *and* the 4 payload bytes; for `CMD_START`/`CMD_STOP` it covers just `frameType`. A command preceded by a dummy `0x00` byte on the wire (not part of the CRC-checked frame) is normal - it exists purely to hold the line low long enough to wake SnapperGPS from EM3/EM1 sleep before the real sync word arrives.
+
+**ACK frame** (SnapperGPS -> nRF9151) — sent after a CRC-valid command is applied:
+
+```C
+typedef struct {
+  uint8_t syncWord[4];
+  uint8_t frameType;                            // 0x20
+  uint8_t capturingEnabled;                     // resulting state (0/1) - unchanged by CMD_SET_TIME
+  uint16_t crc;                                 // CRC-16/CCITT (poly 0x1021) over frameType..capturingEnabled
+} uartAckFrame_t;
+```
+
+A CRC mismatch or unrecognized command type on either side is silently dropped, with no ACK - the sender is expected to retry.
+
 The CRC is calculated the same way as `GET_FIRMWARE_CRC_MESSAGE` in the [WebUSB Messages](#webusb-messages) section: an initial value of `0`, one left-shift-and-conditionally-XOR-`0x1021` step per bit (most significant bit first) of every covered byte, followed by 16 additional steps with an input bit of `0` to flush the register.
 
 ### Reading the output
 
-[firmware_versions/snapper-uart/tools/read_snapshots.py](firmware_versions/snapper-uart/tools/read_snapshots.py) is a reference host-side script that decodes both frame types above and checks their CRC. Connect a USB-to-UART adapter's RX pin to the device's GPIO1 and its GND to the device's GND (the device only transmits, there is no RX side), then run it from a virtual environment:
+[firmware_versions/snapper-uart/tools/read_snapshots.py](firmware_versions/snapper-uart/tools/read_snapshots.py) is a reference host-side script that decodes the info/snapshot frames above and checks their CRC. It only listens - it doesn't send `CMD_START`, so plugging it in on its own will show the info frame but no snapshots, since SnapperGPS now waits for that command from the nRF9151 before it ever captures anything. Connect a USB-to-UART adapter's RX pin to PC14 (SnapperGPS's LEUART0 TX) and its GND to the device's GND, then run it from a virtual environment:
 
 ```
 cd firmware_versions/snapper-uart/tools

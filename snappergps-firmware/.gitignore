@@ -30,7 +30,14 @@ firmware_versions/snapper-uart/build/*.lst
 firmware_versions/snapper-uart/build/*.map
 firmware_versions/snapper-uart/build/objects/*.d
 firmware_versions/snapper-uart/build/objects/*.o
-firmware_versions/snapper-uart/build/generated/
+
+# Tracked on purpose: the ready-to-flash output, so it can be downloaded and
+# flashed directly from the repo without needing the Docker toolchain set up
+# first. Must be excluded from the *.bin/*.hex patterns above. Re-add and
+# commit these by hand after each firmware change - git won't notice they've
+# gone stale on their own.
+!firmware_versions/snapper-uart/build/uart-snapper.bin
+!firmware_versions/snapper-uart/build/uart-snapper.hex
 
 firmware_versions/snapper-uart/tools/.venv/
 firmware_versions/snapper-uart/tools/__pycache__/
